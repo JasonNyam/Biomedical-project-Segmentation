@@ -1,0 +1,339 @@
+# Import all the necessary libraries
+import os
+import datetime 
+import glob                                           #filename pattern matching
+import random
+import sys
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+#SKIMAGE
+import skimage.io                                     #Used for imshow function
+import skimage.transform                              #Used for resize function
+import skimage.exposure                               #Used for displaying 
+
+#Keras and related modules
+import keras
+from keras import backend as K                        #https://keras.io/backend/
+import tensorflow as tf
+
+#Layers
+from keras.layers import Input, Dense, Activation, ZeroPadding2D, BatchNormalization, Flatten, Conv2D, Conv2DTranspose, UpSampling2D
+from keras.layers import AveragePooling2D, MaxPooling2D, Dropout, GlobalMaxPooling2D, GlobalAveragePooling2D
+from keras.layers import Lambda                        #Lambda wraps arbitrary expression as a Layer object.
+from keras.layers.advanced_activations import LeakyReLU
+from keras.layers.merge import add, concatenate
+from keras.optimizers import *
+
+#To save and reload models
+from keras.models import load_model, Model
+from keras.callbacks import EarlyStopping, ModelCheckpoint
+from keras.utils import multi_gpu_model, plot_model
+
+#For data augmentation
+from keras.preprocessing.image import ImageDataGenerator    
+
+import h5py
+
+filename = '/Users/jasonnyam/Downloads/db_lits_ds.h5'
+f = h5py.File(filename, 'r')
+
+# Data parameters
+vol = 30
+curVol = f[f['ds_volumes'][vol]]
+print(curVol.shape)
+
+curLiver = f[f['ds_livers'][vol]]
+print('Shape:', curLiver.shape)
+print('Type:', curLiver.dtype)
+print('bbmin:', curLiver.attrs['bbmin'])
+print('bbmax:', curLiver.attrs['bbmax'])
+
+def get_slices_idx(gt):
+    bb_z_min = gt.attrs['bbmin'][0]
+    bb_zmax = gt.attrs['bbmax'][0]
+    slice_range = bb_zmax - bb_z_min
+    slice_mid = (bb_zmax + bb_z_min) // 2
+    slice_min = slice_mid - slice_range // 8
+    slice_max = slice_mid + slice_range // 8
+
+    return slice_min, slice_mid, slice_max
+
+
+def plot_cur_case(vol_in, gt):
+
+    slice_min, slice_mid, slice_max = get_slices_idx(gt)
+
+    plt.figure(1)
+    plt.subplot(2, 3, 1)
+    plt.imshow(vol_in[slice_min], cmap='gray')
+    plt.subplot(2, 3, 2)
+    plt.imshow(vol_in[slice_mid], cmap='gray')
+    plt.subplot(2, 3, 3)
+    plt.imshow(vol_in[slice_max], cmap='gray')
+    #plt.axis('off')
+    plt.subplot(2, 3, 4)
+    plt.imshow(gt[slice_min], cmap='gray')
+    plt.subplot(2, 3, 5)
+    plt.imshow(gt[slice_mid], cmap='gray')
+    plt.subplot(2, 3, 6)
+    plt.imshow(gt[slice_max], cmap='gray')
+    plt.show()
+
+#Visualisation of statistics of the data
+#Statistics of each slices for one clients
+
+vol=1
+
+curVol = f[f['ds_volumes'][vol]]
+curLiver = f[f['ds_livers'][vol]]
+slice_min, slice_mid, slice_max=get_slices_idx(curLiver)
+liver_net=[]
+for i in range(slice_min,slice_max):
+
+    mask=curLiver[i]
+    image=curVol[i]
+    
+    imageNet=mask*image
+    liver_net.append(imageNet.ravel())
+    
+GlobalTest=[]
+for i in liver_net:
+    test=[]
+    for j in i:
+        if j>0:
+            test.append(j)
+    GlobalTest.append(test) 
+    
+plt.figure(figsize=(20,10))   
+plt.boxplot(GlobalTest,showfliers=False,showmeans=True);
+plt.rc('font',size=20)
+plt.title(' Client {0} slices details'.format(vol));
+
+#Statistics of all slices for one client 
+vol=1
+curVol = f[f['ds_volumes'][vol]]
+curLiver = f[f['ds_livers'][vol]]
+slice_min, slice_mid, slice_max=get_slices_idx(curLiver)
+liver_net=[]
+data_client=[]
+test=[]
+test2=[]
+
+for i in range(slice_min,slice_max):
+    mask=curLiver[i]
+    image=curVol[i]    
+    imageNet=mask*image
+    liver_net.append(imageNet.ravel())
+    
+
+for l in liver_net:
+        test=np.concatenate((test,l))
+
+for i in test:
+    if i>0:
+        test2.append(i)
+
+
+        
+plt.figure(figsize=(20,10))   
+plt.boxplot(test2,showmeans=True,showfliers=False)
+plt.rc('font',size=20)
+plt.title(' Client {0} slices details'.format(vol));
+print('Average={0:.2f}'.format(np.mean(test2)))
+print('Standard deviation={0:.2f}'.format(np.std(test2)))
+
+#Statistics of all slices for all clients
+vol=1
+def plot_total(vol):
+    curVol = f[f['ds_volumes'][vol]]
+    curLiver = f[f['ds_livers'][vol]]
+    slice_min, slice_mid, slice_max=get_slices_idx(curLiver)
+    liver_net=[]
+    data_client=[]
+    test=[]
+    test2=[]
+
+    for i in range(slice_min,slice_max):
+        mask=curLiver[i]
+        image=curVol[i]    
+        imageNet=mask*image
+        liver_net.append(imageNet.ravel())
+
+
+    for l in liver_net:
+        test=np.concatenate((test,l))
+
+
+    for i in test:
+        if i>0:
+            test2.append(i)
+
+    return test2
+
+final_list=[]
+for i in range(0,30):
+    final_list.append(plot_total(i))
+    
+plt.figure(figsize=(30,14))
+plt.boxplot(final_list);    
+
+####  Definition of the training dataset #####
+
+x_work=64
+y_work=64
+last_train_vol=40
+
+from skimage.transform import resize
+def get_train_and_annotation_data(in_f, x_out, y_out, first_vol_idx, last_vol_idx):
+    
+    
+    number_slices=0
+    for vol in range(first_vol_idx,last_vol_idx):
+        curLiver = f[f['ds_livers'][vol]]
+        slice_min,slic_mid,slice_max=get_slices_idx(curLiver)
+        number_slices=number_slices+slice_max-slice_min +1
+    
+    
+    X_data=np.zeros((number_slices,x_out,y_out))   
+    Y_data=np.zeros((number_slices,x_out,y_out))    
+    
+    k=0
+    for vol in range(first_vol_idx,last_vol_idx):
+        curVol = f[f['ds_volumes'][vol]]
+        curLiver = f[f['ds_livers'][vol]]
+        slice_min,slic_mid,slice_max=get_slices_idx(curLiver)        
+        number_slices_perClient=(slice_max-slice_min+1)
+        
+        X_data[k:k+number_slices_perClient,:,:]=curVol[slice_min:slice_max+1]   
+        Y_data[k:k+number_slices_perClient,:,:]=curLiver[slice_min:slice_max+1]
+        k=k+number_slices_perClient
+    
+
+    X_data=X_data.reshape(X_data.shape[0],x_out,y_out,1)
+    Y_data=Y_data.reshape(Y_data.shape[0],x_out,y_out,1)
+    return np.uint16(X_data), np.uint8(Y_data)
+    
+    
+    size=130
+keep_nb_vol_for_test=30
+def get_train_and_annotation_data2(f, x_work, y_work, keep_nb_vol_for_test,size,mode='Train'):
+    
+    X_data=[]
+    Y_data=[]
+    if mode=='Train':
+        for j in range(size-keep_nb_vol_for_test):
+            curLiver = f[f['ds_livers'][j]]
+            slice_min, slice_mid, slice_max = get_slices_idx(curLiver)
+            for i in range(slice_min,slice_max):
+                im=skimage.transform.resize(f[f['ds_volumes'][j]][i], output_shape=[x_work,y_work,1], mode='constant', preserve_range=True)
+                ma=skimage.transform.resize(f[f['ds_livers'][j]][i], output_shape=[x_work,y_work,1], mode='constant', preserve_range=True) 
+                X_data += [im/np.max(im)]
+                Y_data += [ma]  #take only 3 channels/bands
+                
+
+    if mode=='Test':
+        for j in range(size-keep_nb_vol_for_test,size):
+            curLiver = f[f['ds_livers'][j]]
+            slice_min, slice_mid, slice_max = get_slices_idx(curLiver)
+            for i in range(slice_min,slice_max):
+                im=skimage.transform.resize(f[f['ds_volumes'][j]][i], output_shape=[x_work,y_work,1], mode='constant', preserve_range=True)
+                ma=skimage.transform.resize(f[f['ds_livers'][j]][i], output_shape=[x_work,y_work,1], mode='constant', preserve_range=True) 
+                X_data += [im/np.max(im)]
+                Y_data += [ma]  #take only 3 channels/bands
+    
+    
+    return (np.array(X_data),np.array(Y_data))
+
+
+
+[X_train,Y_train] = get_train_and_annotation_data2(f, x_work, y_work, keep_nb_vol_for_test,size,mode='Train')
+[X_data, Y_data] = get_train_and_annotation_data(f, x_work, y_work, 0, last_train_vol)
+
+###### Design our model architecture  #####
+
+def unet_model_compact(img_width=256, img_height=256):
+    
+    #define the architecture parameters
+    n_channels = [16,32,64,128,256]  #the number of kernels/feature channels per block
+    k_size = (3, 3)                  #size of filter kernel
+    k_init = 'he_normal'             #kernel initializer
+    
+    
+    # Use Keras Input layer to create one
+    inp = Input((img_width,img_height,1))
+    
+  
+                                        
+
+    
+    c1 = Conv2D(16, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same') (inp)  
+    c1 = Conv2D(16, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same') (c1)
+    p1 = MaxPooling2D((2, 2)) (c1)
+
+    c2 = Conv2D(32, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same') (p1) 
+    c2 = Conv2D(32, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same') (c2)
+    p2 = MaxPooling2D((2, 2)) (c2)
+    
+    c3 = Conv2D(64, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same') (p2)
+    c3 = Conv2D(64, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same') (c3)
+    p3 = MaxPooling2D((2, 2)) (c3)
+
+    c4 = Conv2D(128, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same') (p3)
+    c4 = Conv2D(128, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same') (c4)
+    p4 = MaxPooling2D(pool_size=(2, 2)) (c4)
+
+    c5 = Conv2D(256, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same') (p4)  
+    c5 = Conv2D(256, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same') (c5)
+
+    u6 = Conv2DTranspose(128, (2, 2), strides=(2, 2), padding='same') (c5)
+    u6 = concatenate(axis = 1,inputs = [u6, c4])
+    c6 = Conv2D(128, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same') (u6) 
+    c6 = Conv2D(128, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same') (c6)
+
+    u7 = Conv2DTranspose(64, (2, 2), strides=(2, 2), padding='same') (c6)
+    u7 = concatenate(1,[u7, c3])
+    c7 = Conv2D(64, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same') (u7)  
+    c7 = Conv2D(64, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same') (c7)
+
+    u8 = Conv2DTranspose(32, (2, 2), strides=(2, 2), padding='same') (c7)
+    u8 = concatenate(1,[u8, c2])
+    c8 = Conv2D(32, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same') (u8) 
+    c8 = Conv2D(32, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same') (c8)
+
+    u9 = Conv2DTranspose(16, (2, 2), strides=(2, 2), padding='same') (c8)
+    u9 = concatenate(1,[u9, c1])
+    c9 = Conv2D(16, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same') (u9)
+    c9 = Conv2D(16, (3, 3), activation='relu', kernel_initializer='he_normal', padding='same') (c9)
+    
+    # Output
+    outp = Conv2D(1, (1, 1), activation='sigmoid',kernel_initializer='glorot_normal') (c9)
+    
+  
+    #Build Model with the architecture
+    model = Model(inputs=[inp], outputs=[outp])
+    return model
+    
+    # Custom IoU metric
+def mean_iou(y_true, y_pred):
+    prec = []
+    for t in np.arange(0.5, 1.0, 0.05):                       
+        y_pred_ = tf.to_int32(y_pred > t)
+        score, up_opt = tf.metrics.mean_iou(y_true, y_pred_, 2)
+        K.get_session().run(tf.local_variables_initializer()) 
+        with tf.control_dependencies([up_opt]):
+            score = tf.identity(score)
+        prec.append(score)
+    return K.mean(K.stack(prec), axis=0)
+
+# Custom loss function
+def dice_coef(y_true, y_pred):
+    smooth = 1. 
+    y_true_f = K.flatten(y_true)
+    y_pred_f = K.flatten(y_pred)
+    intersection = K.sum(y_true_f * y_pred_f)
+    return (2. * intersection + smooth) / (K.sum(y_true_f) + K.sum(y_pred_f) + smooth)
+
+def costum_dice_loss(y_true, y_pred):
+    return 0.5 * keras.losses.binary_crossentropy(y_true, y_pred) - dice_coef(y_true, y_pred)
